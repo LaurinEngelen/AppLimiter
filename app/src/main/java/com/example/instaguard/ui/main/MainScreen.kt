@@ -492,9 +492,13 @@ fun PermissionRow(
 }
 
 private fun getInstalledApps(context: Context): List<AppItem> {
+    val virtualApps = listOf(
+        AppItem("Instagram Web (Chrome)", "web:instagram.com"),
+        AppItem("YouTube Web (Chrome)", "web:youtube.com")
+    )
     val pm = context.packageManager
     val apps = pm.getInstalledApplications(0)
-    return apps.filter { appInfo ->
+    val userApps = apps.filter { appInfo ->
         val launchIntent = pm.getLaunchIntentForPackage(appInfo.packageName)
         launchIntent != null && appInfo.packageName != context.packageName
     }.map { appInfo ->
@@ -503,6 +507,7 @@ private fun getInstalledApps(context: Context): List<AppItem> {
             packageName = appInfo.packageName
         )
     }.sortedBy { it.name }
+    return virtualApps + userApps
 }
 
 private fun isAccessibilityServiceEnabled(context: Context, service: Class<out AccessibilityService>): Boolean {

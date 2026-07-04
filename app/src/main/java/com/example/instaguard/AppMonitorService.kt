@@ -1,6 +1,9 @@
 package com.example.instaguard
 
 import android.accessibilityservice.AccessibilityService
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -17,6 +20,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
 
@@ -27,18 +31,22 @@ class AppMonitorService : AccessibilityService() {
     private var activeBlockedAppPackage: String? = null
     private var remainingTimeMs: Long = -1
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var warningRunnable: Runnable? = null
-    private var closeRunnable: Runnable? = null
-    private var countdownRunnable: Runnable? = null
+    private val tickHandler = Handler(Looper.getMainLooper())
+    private var tickRunnable: Runnable? = null
 
     private var windowManager: WindowManager? = null
+    
+    // Warning overlay components
     private var warningOverlayView: View? = null
     private var warningTextView: TextView? = null
-    private var cooldownOverlayView: View? = null
-
     private var isWarningOverlayTriggered = false
     private var warningSecondsRemaining = 0
+
+    // Cooldown overlay
+    private var cooldownOverlayView: View? = null
+
+    private val NotificationId = 1001
+    private val ChannelId = "instaguard_timer_channel"
 
     private val screenOffReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -53,6 +61,7 @@ class AppMonitorService : AccessibilityService() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val filter = IntentFilter(Intent.ACTION_SCREEN_OFF)
         registerReceiver(screenOffReceiver, filter)
+        createNotificationChannel()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -65,14 +74,30 @@ class AppMonitorService : AccessibilityService() {
         val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
         val lockedPackages = prefs.getStringSet("locked_packages", emptySet()) ?: emptySet()
 
-        // 1. Cooldown enforcement for any locked app (app-specific check)
-        if (packageName in lockedPackages) {
+        // Map package name to virtual package name if inside Chrome viewing Instagram or YouTube
+        var targetPackage = packageName
+        if (packageName == "com.android.chrome") {
+            val rootNode = rootInActiveWindow
+            val url = getChromeUrl(rootNode)
+            rootNode?.recycle()
+            
+            if (url != null) {
+                if (url.contains("instagram.com")) {
+                    targetPackage = "web:instagram.com"
+                } else if (url.contains("youtube.com") || url.contains("youtu.be")) {
+                    targetPackage = "web:youtube.com"
+                }
+            }
+        }
+
+        // 1. Cooldown enforcement for any locked app or website
+        if (targetPackage in lockedPackages) {
             val now = SystemClock.elapsedRealtime()
-            val cooldownEnd = prefs.getLong("cooldown_end_time_$packageName", 0L)
+            val cooldownEnd = prefs.getLong("cooldown_end_time_$targetPackage", 0L)
             if (now < cooldownEnd) {
                 // Kick out immediately
                 performGlobalAction(GLOBAL_ACTION_HOME)
-                showCooldownBlockerOverlay(cooldownEnd - now, packageName)
+                showCooldownBlockerOverlay(cooldownEnd - now, targetPackage)
                 return
             }
 
@@ -80,29 +105,28 @@ class AppMonitorService : AccessibilityService() {
             if (!isBlockedAppInForeground) {
                 isBlockedAppInForeground = true
                 blockedAppStartTime = now
-                activeBlockedAppPackage = packageName
+                activeBlockedAppPackage = targetPackage
 
                 val limitMinutes = prefs.getFloat("limit_minutes", 5.0f)
                 val limitMs = (limitMinutes * 60 * 1000).toLong()
 
-                // Check 1-hour inactivity reset (app-specific check)
-                val lastExit = prefs.getLong("last_exit_time_$packageName", 0L)
+                // Check 1-hour inactivity reset
+                val lastExit = prefs.getLong("last_exit_time_$targetPackage", 0L)
                 val timeAway = now - lastExit
                 
                 if (lastExit > 0 && timeAway >= 1 * 60 * 60 * 1000) {
                     remainingTimeMs = limitMs
                 } else {
-                    remainingTimeMs = prefs.getLong("remaining_budget_ms_$packageName", limitMs)
+                    remainingTimeMs = prefs.getLong("remaining_budget_ms_$targetPackage", limitMs)
                 }
 
                 if (remainingTimeMs <= 0) {
                     remainingTimeMs = limitMs
                 }
 
-                scheduleTimers()
-            } else if (activeBlockedAppPackage != packageName) {
-                // Switched directly between two different locked apps
-                // Save progress for the previous app
+                startTicking()
+            } else if (activeBlockedAppPackage != targetPackage) {
+                // Switched directly between two different locked apps (e.g. Instagram Web -> YouTube Web)
                 val prevApp = activeBlockedAppPackage
                 if (prevApp != null) {
                     val sessionTime = now - blockedAppStartTime
@@ -115,30 +139,32 @@ class AppMonitorService : AccessibilityService() {
 
                 // Start tracking the new locked app
                 blockedAppStartTime = now
-                activeBlockedAppPackage = packageName
+                activeBlockedAppPackage = targetPackage
 
                 val limitMinutes = prefs.getFloat("limit_minutes", 5.0f)
                 val limitMs = (limitMinutes * 60 * 1000).toLong()
 
                 // Check 1-hour inactivity reset for the new app
-                val lastExit = prefs.getLong("last_exit_time_$packageName", 0L)
+                val lastExit = prefs.getLong("last_exit_time_$targetPackage", 0L)
                 val timeAway = now - lastExit
                 
                 if (lastExit > 0 && timeAway >= 1 * 60 * 60 * 1000) {
                     remainingTimeMs = limitMs
                 } else {
-                    remainingTimeMs = prefs.getLong("remaining_budget_ms_$packageName", limitMs)
+                    remainingTimeMs = prefs.getLong("remaining_budget_ms_$targetPackage", limitMs)
                 }
 
                 if (remainingTimeMs <= 0) {
                     remainingTimeMs = limitMs
                 }
 
-                scheduleTimers()
+                startTicking()
             } else {
-                // Still in same locked app: if warning is triggered, make sure warning overlay is visible
-                if (isWarningOverlayTriggered) {
-                    addWarningOverlayView()
+                // Still in same locked app: ensure warning overlays are visible
+                if (isBlockedAppInForeground) {
+                    if (isWarningOverlayTriggered) {
+                        addWarningOverlayView()
+                    }
                 }
             }
         } else {
@@ -152,10 +178,10 @@ class AppMonitorService : AccessibilityService() {
 
             if (packageName != this.packageName) {
                 if (packageName in ignoredPackages) {
-                    // Temporarily hide the overlay view, but keep the session active
+                    // Temporarily hide overlays to not block keyboard or system panels
                     removeWarningOverlayView()
                 } else {
-                    // Left blocked apps completely: save progress and reset timers
+                    // Left blocked apps completely: save progress and stop overlays/timers
                     saveSessionProgressAndReset()
                 }
             }
@@ -189,54 +215,58 @@ class AppMonitorService : AccessibilityService() {
         isBlockedAppInForeground = false
         activeBlockedAppPackage = null
         blockedAppStartTime = 0
-        cancelTimers()
-        removeWarningOverlay()
+        stopTicking()
     }
 
-    private fun scheduleTimers() {
-        cancelTimers()
-
-        val app = activeBlockedAppPackage ?: return
-        val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
-        val limitMinutes = prefs.getFloat("limit_minutes", 5.0f)
-        val warningSeconds = prefs.getInt("warning_seconds", 30)
-        val cooldownMinutes = prefs.getFloat("cooldown_minutes", 10.0f)
-
-        val limitMs = (limitMinutes * 60 * 1000).toLong()
-        val warningMs = (warningSeconds * 1000).toLong()
-
-        // Cap remaining budget if limit was decreased in settings
-        if (remainingTimeMs > limitMs || remainingTimeMs <= 0) {
-            remainingTimeMs = limitMs
-        }
-
-        // Schedule warning overlay
-        if (remainingTimeMs > warningMs) {
-            val warningTriggerMs = remainingTimeMs - warningMs
-            warningRunnable = Runnable {
-                showWarningOverlay(warningSeconds)
+    private fun startTicking() {
+        stopTicking()
+        
+        tickRunnable = object : Runnable {
+            override fun run() {
+                if (!isBlockedAppInForeground) return
+                
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - blockedAppStartTime
+                blockedAppStartTime = now // reset start time to current tick
+                
+                remainingTimeMs = (remainingTimeMs - elapsed).coerceAtLeast(0)
+                
+                // Save progress to prefs (asynchronously)
+                val app = activeBlockedAppPackage
+                if (app != null) {
+                    val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
+                    prefs.edit().putLong("remaining_budget_ms_$app", remainingTimeMs).apply()
+                    
+                    // Show minimal countdown notification in status bar
+                    val appLabel = getAppLabel(this@AppMonitorService, app)
+                    showNotification(appLabel, remainingTimeMs)
+                }
+                
+                val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
+                val warningSeconds = prefs.getInt("warning_seconds", 30)
+                val warningMs = (warningSeconds * 1000).toLong()
+                
+                if (remainingTimeMs <= warningMs) {
+                    val remainingSecs = (remainingTimeMs / 1000).toInt().coerceAtLeast(1)
+                    showWarningOverlay(remainingSecs)
+                }
+                
+                if (remainingTimeMs <= 0) {
+                    val cooldownMinutes = prefs.getFloat("cooldown_minutes", 10.0f)
+                    closeAppAndStartCooldown(cooldownMinutes)
+                } else {
+                    tickHandler.postDelayed(this, 1000)
+                }
             }
-            handler.postDelayed(warningRunnable!!, warningTriggerMs)
-        } else {
-            // Already in warning zone: show immediately with remaining seconds
-            val remainingSecs = (remainingTimeMs / 1000).toInt().coerceAtLeast(1)
-            showWarningOverlay(remainingSecs)
         }
-
-        // Schedule closing action
-        closeRunnable = Runnable {
-            closeAppAndStartCooldown(cooldownMinutes)
-        }
-        handler.postDelayed(closeRunnable!!, remainingTimeMs)
+        tickHandler.post(tickRunnable!!)
     }
 
-    private fun cancelTimers() {
-        warningRunnable?.let { handler.removeCallbacks(it) }
-        closeRunnable?.let { handler.removeCallbacks(it) }
-        countdownRunnable?.let { handler.removeCallbacks(it) }
-        warningRunnable = null
-        closeRunnable = null
-        countdownRunnable = null
+    private fun stopTicking() {
+        tickRunnable?.let { tickHandler.removeCallbacks(it) }
+        tickRunnable = null
+        cancelNotification()
+        removeWarningOverlay()
     }
 
     private fun closeAppAndStartCooldown(cooldownMinutes: Float) {
@@ -265,96 +295,66 @@ class AppMonitorService : AccessibilityService() {
         showCooldownBlockerOverlay(cooldownMs, packageToBlock)
     }
 
-    private fun showWarningOverlay(initialSeconds: Int) {
-        removeWarningOverlay()
-        
+    // --- Warning Overlay ---
+
+    private fun showWarningOverlay(seconds: Int) {
         isWarningOverlayTriggered = true
-        warningSecondsRemaining = initialSeconds
+        warningSecondsRemaining = seconds
 
-        // Start countdown timer loop
-        countdownRunnable = object : Runnable {
-            override fun run() {
-                if (warningSecondsRemaining > 0) {
-                    warningSecondsRemaining--
-                    updateWarningOverlayText()
-                    
-                    // Periodically update budget in SharedPreferences for this app
-                    val app = activeBlockedAppPackage
-                    if (app != null) {
-                        val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
-                        prefs.edit().putLong("remaining_budget_ms_$app", (warningSecondsRemaining * 1000).toLong()).apply()
-                    }
-                    
-                    handler.postDelayed(this, 1000)
-                } else {
-                    isWarningOverlayTriggered = false
-                    removeWarningOverlayView()
-                }
-            }
-        }
-        handler.post(countdownRunnable!!)
-
-        // Show the overlay view if we are currently looking at a blocked app
         if (isBlockedAppInForeground) {
             addWarningOverlayView()
         }
     }
 
     private fun addWarningOverlayView() {
-        if (warningOverlayView != null) return // Already visible
-
-        val context = this
-        val layout = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            val pad = (16 * resources.displayMetrics.density).toInt()
-            setPadding(pad, pad, pad, pad)
-            
-            // Glassmorphism-style clean warm white background (slightly transparent)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#BFFAFAFA")) // Semi-transparent greyish-white (75% opacity)
-                cornerRadius = 24 * resources.displayMetrics.density
-                setStroke((1.5f * resources.displayMetrics.density).toInt(), Color.parseColor("#E0E0E0")) // Subtle grey border
+        if (warningOverlayView == null) {
+            val context = this
+            val layout = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                val pad = (16 * resources.displayMetrics.density).toInt()
+                setPadding(pad, pad, pad, pad)
+                
+                // Glassmorphism-style clean warm white background (slightly transparent)
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#BFFAFAFA")) // Semi-transparent greyish-white (75% opacity)
+                    cornerRadius = 24 * resources.displayMetrics.density
+                    setStroke((1.5f * resources.displayMetrics.density).toInt(), Color.parseColor("#E0E0E0")) // Subtle grey border
+                }
+                elevation = 10f * resources.displayMetrics.density
             }
-            
-            // Soft elevation shadow
-            elevation = 10f * resources.displayMetrics.density
-        }
 
-        val appLabel = activeBlockedAppPackage?.let { getAppLabel(context, it) } ?: "App"
-        val textView = TextView(context).apply {
-            // Stylized HTML text: bold app label, bold red remaining seconds
-            text = Html.fromHtml(
-                "Zeitwächter: <b>$appLabel</b> schließt in <font color='#E53935'><b>$warningSecondsRemaining</b></font> Sekunden!",
-                Html.FROM_HTML_MODE_LEGACY
-            )
-            setTextColor(Color.parseColor("#1E1E24")) // Deep carbon text
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            gravity = Gravity.CENTER
-        }
-        layout.addView(textView)
-        warningTextView = textView
+            val textView = TextView(context).apply {
+                setTextColor(Color.parseColor("#1E1E24")) // Deep carbon text
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                gravity = Gravity.CENTER
+            }
+            layout.addView(textView)
+            warningTextView = textView
 
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or 
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or 
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = (80 * resources.displayMetrics.density).toInt() // Position in upper part of screen
-            width = (resources.displayMetrics.widthPixels * 0.9).toInt()
-        }
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or 
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or 
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                y = (80 * resources.displayMetrics.density).toInt() // Position lower than status bar
+                width = (resources.displayMetrics.widthPixels * 0.9).toInt()
+            }
 
-        try {
-            windowManager?.addView(layout, params)
-            warningOverlayView = layout
-        } catch (e: Exception) {
-            e.printStackTrace()
+            try {
+                windowManager?.addView(layout, params)
+                warningOverlayView = layout
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
+        
+        updateWarningOverlayText()
     }
 
     private fun updateWarningOverlayText() {
@@ -379,11 +379,59 @@ class AppMonitorService : AccessibilityService() {
 
     private fun removeWarningOverlay() {
         removeWarningOverlayView()
-        countdownRunnable?.let { handler.removeCallbacks(it) }
-        countdownRunnable = null
         isWarningOverlayTriggered = false
         warningSecondsRemaining = 0
     }
+
+    // --- Status Bar Low-Priority Notification ---
+
+    private fun createNotificationChannel() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                ChannelId,
+                "AppLimiter Zeitlimits",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Zeigt verbleibende App-Zeitlimits in der Statusleiste."
+                setShowBadge(false)
+            }
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun showNotification(appLabel: String, remainingMs: Long) {
+        val totalSecs = (remainingMs / 1000).coerceAtLeast(0)
+        val mins = totalSecs / 60
+        val secs = totalSecs % 60
+        val timeString = String.format("%02d:%02d verbleibend", mins, secs)
+
+        val notification = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            Notification.Builder(this, ChannelId)
+        } else {
+            Notification.Builder(this)
+        }.apply {
+            setSmallIcon(R.drawable.ic_notification)
+            // Title contains app label and countdown to keep it as compact and minimal as possible
+            setContentTitle("$appLabel: $timeString")
+            setOngoing(true)
+            setOnlyAlertOnce(true)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                setVisibility(Notification.VISIBILITY_PUBLIC)
+                setCategory(Notification.CATEGORY_PROGRESS)
+            }
+        }.build()
+
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NotificationId, notification)
+    }
+
+    private fun cancelNotification() {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.cancel(NotificationId)
+    }
+
+    // --- Cooldown Overlay ---
 
     private fun showCooldownBlockerOverlay(remainingMs: Long, packageName: String) {
         cooldownOverlayView?.let {
@@ -451,7 +499,7 @@ class AppMonitorService : AccessibilityService() {
             cooldownOverlayView = layout
 
             // Auto-dismiss after 3 seconds
-            handler.postDelayed({
+            tickHandler.postDelayed({
                 cooldownOverlayView?.let {
                     try {
                         windowManager?.removeView(it)
@@ -466,7 +514,36 @@ class AppMonitorService : AccessibilityService() {
         }
     }
 
+    private fun getChromeUrl(node: AccessibilityNodeInfo?): String? {
+        if (node == null) return null
+        
+        val viewId = node.viewIdResourceName
+        if (viewId != null && (viewId == "com.android.chrome:id/url_bar" || viewId == "com.android.chrome:id/search_box_text")) {
+            val text = node.text?.toString()
+            if (!text.isNullOrBlank()) {
+                return text
+            }
+        }
+        
+        val text = node.text?.toString()
+        if (text != null && (text.contains("instagram.com") || text.contains("youtube.com") || text.contains("youtu.be"))) {
+            return text
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val url = getChromeUrl(child)
+            child.recycle()
+            if (url != null) {
+                return url
+            }
+        }
+        return null
+    }
+
     private fun getAppLabel(context: Context, packageName: String): String {
+        if (packageName == "web:instagram.com") return "Instagram Web"
+        if (packageName == "web:youtube.com") return "YouTube Web"
         return try {
             val pm = context.packageManager
             val appInfo = pm.getApplicationInfo(packageName, 0)

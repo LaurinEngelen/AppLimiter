@@ -4,44 +4,51 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
     
-    <!-- Timer Top Button (Stopwatch crown) -->
-    <path
-        android:strokeWidth="4"
-        android:strokeColor="#757575"
-        android:strokeLineCap="round"
-        android:fillColor="#00000000"
-        android:pathData="M48,22 H60" />
+    <!-- Group with vertical-only translation for perfect optical centering on both axes -->
+    <group 
+        android:translateX="0"
+        android:translateY="1.5">
         
-    <!-- Timer Top Stem -->
-    <path
-        android:strokeWidth="4"
-        android:strokeColor="#757575"
-        android:strokeLineCap="round"
-        android:fillColor="#00000000"
-        android:pathData="M54,22 V32" />
-        
-    <!-- Timer Side Button -->
-    <path
-        android:strokeWidth="3.5"
-        android:strokeColor="#757575"
-        android:strokeLineCap="round"
-        android:fillColor="#00000000"
-        android:pathData="M68,36 L73,41" />
+        <!-- Scaled-down Timer Top Button (Stopwatch crown) -->
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#757575"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000"
+            android:pathData="M50,32 H58" />
+            
+        <!-- Scaled-down Timer Top Stem -->
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#757575"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000"
+            android:pathData="M54,32 V39" />
+            
+        <!-- Scaled-down Timer Side Button -->
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#757575"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000"
+            android:pathData="M63.5,44.5 L67.5,40.5" />
 
-    <!-- Timer Outer Ring (Clock body) -->
-    <path
-        android:strokeWidth="4.5"
-        android:strokeColor="#757575"
-        android:fillColor="#00000000"
-        android:pathData="M54,32 C66.15,32 76,41.85 76,54 C76,66.15 66.15,76 54,76 C41.85,76 32,66.15 32,54 C32,41.85 41.85,32 54,32 Z" />
+        <!-- Scaled-down Timer Outer Ring (Clock body, radius 15) -->
+        <path
+            android:strokeWidth="3.5"
+            android:strokeColor="#757575"
+            android:fillColor="#00000000"
+            android:pathData="M54,39 C62.28,39 69,45.72 69,54 C69,62.28 62.28,69 54,69 C45.72,69 39,62.28 39,54 C39,45.72 45.72,39 54,39 Z" />
 
-    <!-- Timer Hands (L-shape showing 3 o'clock) -->
-    <path
-        android:strokeWidth="4.5"
-        android:strokeColor="#757575"
-        android:strokeLineCap="round"
-        android:strokeLineJoin="round"
-        android:fillColor="#00000000"
-        android:pathData="M54,42 V54 H64" />
+        <!-- Scaled-down Timer Hands (L-shape showing 3 o'clock) -->
+        <path
+            android:strokeWidth="3.5"
+            android:strokeColor="#757575"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:fillColor="#00000000"
+            android:pathData="M54,46 V54 H61" />
+            
+    </group>
 
 </vector>
