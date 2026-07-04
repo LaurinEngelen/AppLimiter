@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AppLimiter</string>
+    <string name="accessibility_service_description">Überwacht die App-Nutzung, um nach Ablauf des Limits zu schließen und Cooldowns durchzusetzen.</string>
+</resources>
