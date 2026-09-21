@@ -200,13 +200,6 @@ class AppMonitorService : AccessibilityService() {
                     val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
                     val nowWall = System.currentTimeMillis()
 
-                    // Check if < 1/4 budget reset fired
-                    val checkedBudget = BudgetManager.getOrResetBudgetMs(prefs, app, nowWall)
-                    val quarterLimit = BudgetManager.getLimitMs(prefs) / 4
-                    if (checkedBudget > remainingTimeMs && remainingTimeMs < quarterLimit) {
-                        remainingTimeMs = checkedBudget
-                    }
-
                     BudgetManager.recordBudgetProgress(prefs, app, remainingTimeMs, nowWall)
                     
                     // Show minimal countdown notification in status bar
