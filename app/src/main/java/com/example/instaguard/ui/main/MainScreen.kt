@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
 import androidx.compose.foundation.border
@@ -32,6 +31,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation3.runtime.NavKey
 import com.example.instaguard.AppMonitorService
+import com.example.instaguard.BudgetManager
+import com.example.instaguard.PinManager
+import com.example.instaguard.ui.pin.PinSetupDialog
+import com.example.instaguard.ui.pin.PinVerifyDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -69,6 +72,12 @@ fun MainScreen(
     // Cooldown trigger state (drives general UI update ticks)
     var uiTickTrigger by remember { mutableStateOf(0L) }
 
+    // PIN states
+    var isPinEnabled by remember { mutableStateOf(PinManager.isPinEnabled(prefs)) }
+    var showSetupPinDialog by remember { mutableStateOf(false) }
+    var showChangePinVerifyOldDialog by remember { mutableStateOf(false) }
+    var showDisablePinDialog by remember { mutableStateOf(false) }
+
     // Load installed applications list asynchronously
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
@@ -82,7 +91,7 @@ fun MainScreen(
         while (true) {
             accessibilityEnabled = isAccessibilityServiceEnabled(context, AppMonitorService::class.java)
             overlayGranted = Settings.canDrawOverlays(context)
-            uiTickTrigger = SystemClock.elapsedRealtime()
+            uiTickTrigger = System.currentTimeMillis()
             delay(1000)
         }
     }
@@ -157,19 +166,15 @@ fun MainScreen(
                             appsList.find { it.packageName == pkg }?.name ?: pkg.substringAfterLast('.')
                         }
 
-                        // Read states dynamically utilizing uiTickTrigger to re-read SharedPreferences every second
-                        val budget = remember(pkg, uiTickTrigger) { prefs.getLong("remaining_budget_ms_$pkg", limitMs) }
-                        val lastExit = remember(pkg, uiTickTrigger) { prefs.getLong("last_exit_time_$pkg", 0L) }
-                        val cooldownEnd = remember(pkg, uiTickTrigger) { prefs.getLong("cooldown_end_time_$pkg", 0L) }
-                        val now = SystemClock.elapsedRealtime()
+                        // Read states dynamically utilizing uiTickTrigger to re-evaluate every second
+                        val nowWall = System.currentTimeMillis()
+                        val cooldownRemaining = remember(pkg, uiTickTrigger) {
+                            BudgetManager.getActiveCooldownRemainingMs(prefs, pkg, nowWall)
+                        }
+                        val isCooldownActive = cooldownRemaining > 0L
 
-                        val isCooldownActive = now < cooldownEnd
-                        val cooldownRemaining = if (isCooldownActive) cooldownEnd - now else 0L
-
-                        val appRemainingMs = if (lastExit > 0 && (now - lastExit) >= 1 * 60 * 60 * 1000) {
-                            limitMs
-                        } else {
-                            if (budget <= 0) limitMs else budget
+                        val appRemainingMs = remember(pkg, uiTickTrigger) {
+                            BudgetManager.getOrResetBudgetMs(prefs, pkg, nowWall)
                         }
 
                         Row(
@@ -203,12 +208,8 @@ fun MainScreen(
                             
                             OutlinedButton(
                                 onClick = {
-                                    prefs.edit()
-                                        .putLong("remaining_budget_ms_$pkg", limitMs)
-                                        .putLong("cooldown_end_time_$pkg", 0L)
-                                        .putLong("last_exit_time_$pkg", SystemClock.elapsedRealtime())
-                                        .apply()
-                                    uiTickTrigger = SystemClock.elapsedRealtime() // Force UI update
+                                    BudgetManager.resetApp(prefs, pkg)
+                                    uiTickTrigger = System.currentTimeMillis() // Force UI update
                                 },
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                                 modifier = Modifier.height(32.dp)
@@ -221,7 +222,7 @@ fun MainScreen(
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     
                     Text(
-                        text = "Jede App hat ihr eigenes Limit. Die Ablaufzeit setzt sich nach 1h Inaktivität zurück.",
+                        text = "Jede App hat ihr eigenes Limit. Setzt sich nach 1h Inaktivität oder bei < 1/4 Restzeit nach 1h automatisch zurück.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 4.dp)
@@ -294,7 +295,7 @@ fun MainScreen(
                                         }
                                         selectedPackages = updated
                                         prefs.edit().putStringSet("locked_packages", updated).apply()
-                                        uiTickTrigger = SystemClock.elapsedRealtime() // Force UI update
+                                        uiTickTrigger = System.currentTimeMillis() // Force UI update
                                     }
                                     .padding(vertical = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -420,21 +421,19 @@ fun MainScreen(
                         val limit = limitInput.toFloatOrNull() ?: 5.0f
                         val warning = warningInput.toIntOrNull() ?: 30
                         val cooldown = cooldownInput.toFloatOrNull() ?: 10.0f
-                        val limitMs = (limit * 60 * 1000).toLong()
 
-                        val editor = prefs.edit()
+                        prefs.edit()
                             .putFloat("limit_minutes", limit)
                             .putInt("warning_seconds", warning)
                             .putFloat("cooldown_minutes", cooldown)
+                            .apply()
 
                         // Reset all active budgets to the new limit
                         selectedPackages.forEach { pkg ->
-                            editor.putLong("remaining_budget_ms_$pkg", limitMs)
-                            editor.putLong("last_exit_time_$pkg", SystemClock.elapsedRealtime())
+                            BudgetManager.resetApp(prefs, pkg)
                         }
-                        editor.apply()
                             
-                        uiTickTrigger = SystemClock.elapsedRealtime() // Force UI update
+                        uiTickTrigger = System.currentTimeMillis() // Force UI update
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(8.dp)
@@ -443,6 +442,125 @@ fun MainScreen(
                 }
             }
         }
+
+        // Security & PIN Lock Section
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "PIN-Sperre",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            text = if (isPinEnabled) {
+                                "App ist mit 4-stelligem PIN geschützt"
+                            } else {
+                                "Schütze AppLimiter vor unbefugten Änderungen"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    if (isPinEnabled) {
+                        Surface(
+                            color = Color(0xFFE8F5E9),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.padding(start = 8.dp)
+                        ) {
+                            Text(
+                                text = "Aktiv",
+                                color = Color(0xFF2E7D32),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+
+                if (!isPinEnabled) {
+                    Button(
+                        onClick = { showSetupPinDialog = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("4-stelligen PIN einrichten")
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { showChangePinVerifyOldDialog = true },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("PIN ändern")
+                        }
+
+                        OutlinedButton(
+                            onClick = { showDisablePinDialog = true },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            ),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("Deaktivieren")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showSetupPinDialog) {
+        PinSetupDialog(
+            onDismiss = { showSetupPinDialog = false },
+            onPinSet = {
+                showSetupPinDialog = false
+                isPinEnabled = PinManager.isPinEnabled(prefs)
+            }
+        )
+    }
+
+    if (showChangePinVerifyOldDialog) {
+        PinVerifyDialog(
+            title = "Bisherigen PIN bestätigen",
+            subtitle = "Gib deinen bisherigen PIN ein, um einen neuen festzulegen",
+            onDismiss = { showChangePinVerifyOldDialog = false },
+            onVerified = {
+                showChangePinVerifyOldDialog = false
+                showSetupPinDialog = true
+            }
+        )
+    }
+
+    if (showDisablePinDialog) {
+        PinVerifyDialog(
+            title = "PIN deaktivieren",
+            subtitle = "Gib deinen aktuellen PIN ein, um die Sperre aufzuheben",
+            onDismiss = { showDisablePinDialog = false },
+            onVerified = {
+                PinManager.disablePin(prefs)
+                isPinEnabled = false
+                showDisablePinDialog = false
+            }
+        )
     }
 }
 

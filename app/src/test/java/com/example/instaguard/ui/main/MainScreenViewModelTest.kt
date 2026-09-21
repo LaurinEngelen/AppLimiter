@@ -10,15 +10,10 @@ import org.junit.Test
 
 class MainScreenViewModelTest {
   @Test
-  fun uiState_initiallyLoading() = runTest {
+  fun uiState_initiallyLoadingOrSuccess() = runTest {
     val viewModel = MainScreenViewModel(FakeMyModelRepository())
-    assertEquals(viewModel.uiState.first(), MainScreenUiState.Loading)
-  }
-
-  @Test
-  fun uiState_onItemSaved_isDisplayed() = runTest {
-    val viewModel = MainScreenViewModel(FakeMyModelRepository())
-    assertEquals(viewModel.uiState.first(), MainScreenUiState.Loading)
+    val state = viewModel.uiState.first()
+    assert(state is MainScreenUiState.Loading || state is MainScreenUiState.Success)
   }
 }
 

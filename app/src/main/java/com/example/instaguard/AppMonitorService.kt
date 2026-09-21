@@ -92,72 +92,39 @@ class AppMonitorService : AccessibilityService() {
 
         // 1. Cooldown enforcement for any locked app or website
         if (targetPackage in lockedPackages) {
-            val now = SystemClock.elapsedRealtime()
-            val cooldownEnd = prefs.getLong("cooldown_end_time_$targetPackage", 0L)
-            if (now < cooldownEnd) {
+            val nowWall = System.currentTimeMillis()
+            val cooldownRemaining = BudgetManager.getActiveCooldownRemainingMs(prefs, targetPackage, nowWall)
+            if (cooldownRemaining > 0L) {
                 // Kick out immediately
                 performGlobalAction(GLOBAL_ACTION_HOME)
-                showCooldownBlockerOverlay(cooldownEnd - now, targetPackage)
+                showCooldownBlockerOverlay(cooldownRemaining, targetPackage)
                 return
             }
+
+            val nowRealtime = SystemClock.elapsedRealtime()
 
             // 2. Locked app opened or returned to focus
             if (!isBlockedAppInForeground) {
                 isBlockedAppInForeground = true
-                blockedAppStartTime = now
+                blockedAppStartTime = nowRealtime
                 activeBlockedAppPackage = targetPackage
 
-                val limitMinutes = prefs.getFloat("limit_minutes", 5.0f)
-                val limitMs = (limitMinutes * 60 * 1000).toLong()
-
-                // Check 1-hour inactivity reset
-                val lastExit = prefs.getLong("last_exit_time_$targetPackage", 0L)
-                val timeAway = now - lastExit
-                
-                if (lastExit > 0 && timeAway >= 1 * 60 * 60 * 1000) {
-                    remainingTimeMs = limitMs
-                } else {
-                    remainingTimeMs = prefs.getLong("remaining_budget_ms_$targetPackage", limitMs)
-                }
-
-                if (remainingTimeMs <= 0) {
-                    remainingTimeMs = limitMs
-                }
-
+                remainingTimeMs = BudgetManager.getOrResetBudgetMs(prefs, targetPackage, nowWall)
                 startTicking()
             } else if (activeBlockedAppPackage != targetPackage) {
                 // Switched directly between two different locked apps (e.g. Instagram Web -> YouTube Web)
                 val prevApp = activeBlockedAppPackage
                 if (prevApp != null) {
-                    val sessionTime = now - blockedAppStartTime
+                    val sessionTime = nowRealtime - blockedAppStartTime
                     val prevRemaining = (remainingTimeMs - sessionTime).coerceAtLeast(0)
-                    prefs.edit()
-                        .putLong("remaining_budget_ms_$prevApp", prevRemaining)
-                        .putLong("last_exit_time_$prevApp", now)
-                        .apply()
+                    BudgetManager.recordBudgetProgress(prefs, prevApp, prevRemaining, nowWall)
                 }
 
                 // Start tracking the new locked app
-                blockedAppStartTime = now
+                blockedAppStartTime = nowRealtime
                 activeBlockedAppPackage = targetPackage
 
-                val limitMinutes = prefs.getFloat("limit_minutes", 5.0f)
-                val limitMs = (limitMinutes * 60 * 1000).toLong()
-
-                // Check 1-hour inactivity reset for the new app
-                val lastExit = prefs.getLong("last_exit_time_$targetPackage", 0L)
-                val timeAway = now - lastExit
-                
-                if (lastExit > 0 && timeAway >= 1 * 60 * 60 * 1000) {
-                    remainingTimeMs = limitMs
-                } else {
-                    remainingTimeMs = prefs.getLong("remaining_budget_ms_$targetPackage", limitMs)
-                }
-
-                if (remainingTimeMs <= 0) {
-                    remainingTimeMs = limitMs
-                }
-
+                remainingTimeMs = BudgetManager.getOrResetBudgetMs(prefs, targetPackage, nowWall)
                 startTicking()
             } else {
                 // Still in same locked app: ensure warning overlays are visible
@@ -201,15 +168,12 @@ class AppMonitorService : AccessibilityService() {
     private fun saveSessionProgressAndReset() {
         val app = activeBlockedAppPackage
         if (isBlockedAppInForeground && app != null) {
-            val now = SystemClock.elapsedRealtime()
-            val sessionTime = now - blockedAppStartTime
+            val nowRealtime = SystemClock.elapsedRealtime()
+            val sessionTime = nowRealtime - blockedAppStartTime
             remainingTimeMs = (remainingTimeMs - sessionTime).coerceAtLeast(0)
 
             val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
-            prefs.edit()
-                .putLong("remaining_budget_ms_$app", remainingTimeMs)
-                .putLong("last_exit_time_$app", now)
-                .apply()
+            BudgetManager.recordBudgetProgress(prefs, app, remainingTimeMs, System.currentTimeMillis())
         }
         
         isBlockedAppInForeground = false
@@ -225,17 +189,25 @@ class AppMonitorService : AccessibilityService() {
             override fun run() {
                 if (!isBlockedAppInForeground) return
                 
-                val now = SystemClock.elapsedRealtime()
-                val elapsed = now - blockedAppStartTime
-                blockedAppStartTime = now // reset start time to current tick
+                val nowRealtime = SystemClock.elapsedRealtime()
+                val elapsed = nowRealtime - blockedAppStartTime
+                blockedAppStartTime = nowRealtime // reset start time to current tick
                 
                 remainingTimeMs = (remainingTimeMs - elapsed).coerceAtLeast(0)
                 
-                // Save progress to prefs (asynchronously)
                 val app = activeBlockedAppPackage
                 if (app != null) {
                     val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
-                    prefs.edit().putLong("remaining_budget_ms_$app", remainingTimeMs).apply()
+                    val nowWall = System.currentTimeMillis()
+
+                    // Check if < 1/4 budget reset fired
+                    val checkedBudget = BudgetManager.getOrResetBudgetMs(prefs, app, nowWall)
+                    val quarterLimit = BudgetManager.getLimitMs(prefs) / 4
+                    if (checkedBudget > remainingTimeMs && remainingTimeMs < quarterLimit) {
+                        remainingTimeMs = checkedBudget
+                    }
+
+                    BudgetManager.recordBudgetProgress(prefs, app, remainingTimeMs, nowWall)
                     
                     // Show minimal countdown notification in status bar
                     val appLabel = getAppLabel(this@AppMonitorService, app)
@@ -275,20 +247,10 @@ class AppMonitorService : AccessibilityService() {
         // Go home to close active blocked app
         performGlobalAction(GLOBAL_ACTION_HOME)
         
-        // Save cooldown timestamp specifically for this app
-        val cooldownMs = (cooldownMinutes * 60 * 1000).toLong()
-        val cooldownEnd = SystemClock.elapsedRealtime() + cooldownMs
-
         val prefs = getSharedPreferences("instaguard_prefs", Context.MODE_PRIVATE)
+        val cooldownMs = BudgetManager.startCooldown(prefs, packageToBlock, cooldownMinutes)
         
-        // Reset budget completely for this app
         remainingTimeMs = 0
-        prefs.edit()
-            .putLong("cooldown_end_time_$packageToBlock", cooldownEnd)
-            .putLong("remaining_budget_ms_$packageToBlock", 0L)
-            .putLong("last_exit_time_$packageToBlock", SystemClock.elapsedRealtime())
-            .apply()
-
         saveSessionProgressAndReset()
         
         // Display a brief cooldown notice for this app
